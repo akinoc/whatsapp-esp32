@@ -3,18 +3,49 @@ import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import requests
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "akin-esp32-2026")
 
-# Silme komutlarını yalnızca bu numaradan kabul eder.
-AUTHORIZED_NUMBER = os.getenv(
-    "AUTHORIZED_NUMBER",
-    "905056352875",
+# ----------------------------------------------------
+# Ortam değişkenleri
+# ----------------------------------------------------
+VERIFY_TOKEN = os.getenv(
+    "VERIFY_TOKEN",
+    "akin-esp32-2026",
 )
 
+# Birden fazla yetkili numara virgülle ayrılır.
+AUTHORIZED_NUMBERS = {
+    number.strip()
+    for number in os.getenv(
+        "AUTHORIZED_NUMBERS",
+        "905056352875,905056941962",
+    ).split(",")
+    if number.strip()
+}
+
+WHATSAPP_ACCESS_TOKEN = os.getenv(
+    "WHATSAPP_ACCESS_TOKEN",
+    "",
+)
+
+WHATSAPP_PHONE_NUMBER_ID = os.getenv(
+    "WHATSAPP_PHONE_NUMBER_ID",
+    "",
+)
+
+GRAPH_API_VERSION = os.getenv(
+    "GRAPH_API_VERSION",
+    "",
+)
+
+
+# ----------------------------------------------------
+# Genel ayarlar
+# ----------------------------------------------------
 ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
 MAX_MESSAGES = 5
 
@@ -25,6 +56,9 @@ stored_date = datetime.now(ISTANBUL_TZ).date()
 last_webhook_payload = {}
 
 
+# ----------------------------------------------------
+# Tarih ve günlük sıfırlama
+# ----------------------------------------------------
 def now_istanbul():
     return datetime.now(ISTANBUL_TZ)
 
@@ -42,60 +76,217 @@ def reset_if_new_day():
         stored_date = today
 
         print(
-            f"Yeni gun basladi. Mesaj listesi sifirlandi: {today}",
+            f"Yeni gun basladi. Mesajlar sifirlandi: {today}",
             flush=True,
         )
 
 
+# ----------------------------------------------------
+# WhatsApp üzerinden cevap gönderme
+# ----------------------------------------------------
+def send_whatsapp_text(recipient, text):
+    if not WHATSAPP_ACCESS_TOKEN:
+        print(
+            "WHATSAPP_ACCESS_TOKEN tanimlanmamis.",
+            flush=True,
+        )
+        return False
+
+    if not WHATSAPP_PHONE_NUMBER_ID:
+        print(
+            "WHATSAPP_PHONE_NUMBER_ID tanimlanmamis.",
+            flush=True,
+        )
+        return False
+
+    if not GRAPH_API_VERSION:
+        print(
+            "GRAPH_API_VERSION tanimlanmamis.",
+            flush=True,
+        )
+        return False
+
+    url = (
+        f"https://graph.facebook.com/"
+        f"{GRAPH_API_VERSION}/"
+        f"{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient,
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": text,
+        },
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+
+        print(
+            f"WhatsApp cevap HTTP kodu: {response.status_code}",
+            flush=True,
+        )
+
+        if not response.ok:
+            print(
+                f"WhatsApp cevap hatasi: {response.text}",
+                flush=True,
+            )
+            return False
+
+        print(
+            f"WhatsApp cevabi gonderildi: {recipient}",
+            flush=True,
+        )
+        return True
+
+    except requests.RequestException as error:
+        print(
+            f"WhatsApp cevap baglanti hatasi: {error}",
+            flush=True,
+        )
+        return False
+
+
+# ----------------------------------------------------
+# Mesaj listesini WhatsApp metnine çevirme
+# ----------------------------------------------------
+def build_list_text():
+    reset_if_new_day()
+
+    if not stored_messages:
+        return (
+            "📦 Bugün kayıtlı teslimat kodu bulunmuyor.\n\n"
+            "Yeni bir kod eklemek için normal mesaj gönder."
+        )
+
+    lines = [
+        "📦 Bugünkü Teslimat Kodları",
+        "",
+    ]
+
+    for position, item in enumerate(stored_messages, start=1):
+        message = item.get("message", "")
+        lines.append(f"{position}. {message}")
+
+    lines.append("")
+    lines.append(f"Toplam: {len(stored_messages)} kayıt")
+
+    return "\n".join(lines)
+
+
+def build_help_text():
+    return (
+        "❓ Kullanılabilir Komutlar\n\n"
+        "📋 LISTE\n"
+        "Kayıtlı mesajları gösterir.\n\n"
+        "📊 DURUM\n"
+        "Bugünkü kayıt sayısını gösterir.\n\n"
+        "🗑️ SIL\n"
+        "Tüm kayıtları siler.\n\n"
+        "🗑️ SIL 3\n"
+        "Listedeki 3. kaydı siler.\n\n"
+        "📩 Normal mesaj\n"
+        "Mesajı teslimat kodu olarak listeye ekler."
+    )
+
+
+# ----------------------------------------------------
+# Gelen WhatsApp mesajının içeriğini çıkarma
+# ----------------------------------------------------
 def extract_message_text(incoming):
     message_type = incoming.get("type", "unknown")
 
     if message_type == "text":
-        return incoming.get("text", {}).get("body", "").strip()
+        return (
+            incoming
+            .get("text", {})
+            .get("body", "")
+            .strip()
+        )
 
     if message_type == "button":
-        return incoming.get("button", {}).get(
-            "text",
-            "[buton mesaji]",
-        ).strip()
+        return (
+            incoming
+            .get("button", {})
+            .get("text", "[buton mesaji]")
+            .strip()
+        )
 
     if message_type == "interactive":
         interactive = incoming.get("interactive", {})
         interactive_type = interactive.get("type")
 
         if interactive_type == "button_reply":
-            return interactive.get("button_reply", {}).get(
-                "title",
-                "[buton cevabi]",
-            ).strip()
+            return (
+                interactive
+                .get("button_reply", {})
+                .get("title", "[buton cevabi]")
+                .strip()
+            )
 
         if interactive_type == "list_reply":
-            return interactive.get("list_reply", {}).get(
-                "title",
-                "[liste cevabi]",
-            ).strip()
+            return (
+                interactive
+                .get("list_reply", {})
+                .get("title", "[liste cevabi]")
+                .strip()
+            )
 
         return "[etkilesimli mesaj]"
 
     if message_type == "image":
-        caption = incoming.get("image", {}).get("caption", "").strip()
+        caption = (
+            incoming
+            .get("image", {})
+            .get("caption", "")
+            .strip()
+        )
         return caption or "[resim mesaji]"
 
     if message_type == "document":
-        filename = incoming.get("document", {}).get("filename", "")
-        return f"[dokuman: {filename}]" if filename else "[dokuman mesaji]"
+        filename = (
+            incoming
+            .get("document", {})
+            .get("filename", "")
+        )
+
+        if filename:
+            return f"[dokuman: {filename}]"
+
+        return "[dokuman mesaji]"
 
     if message_type == "audio":
         return "[ses mesaji]"
 
     if message_type == "video":
-        caption = incoming.get("video", {}).get("caption", "").strip()
+        caption = (
+            incoming
+            .get("video", {})
+            .get("caption", "")
+            .strip()
+        )
         return caption or "[video mesaji]"
 
     if message_type == "location":
         location = incoming.get("location", {})
         latitude = location.get("latitude", "")
         longitude = location.get("longitude", "")
+
         return f"[konum: {latitude}, {longitude}]"
 
     if message_type == "contacts":
@@ -107,73 +298,172 @@ def extract_message_text(incoming):
     return f"[{message_type} mesaji]"
 
 
+# ----------------------------------------------------
+# Listedeki tek mesajı silme
+# ----------------------------------------------------
 def delete_message_by_position(position):
     global stored_messages
 
     if position < 1 or position > len(stored_messages):
-        return False
+        return None
 
     deleted_message = stored_messages.pop(position - 1)
 
     print(
-        f"Mesaj silindi. Sira: {position}, Veri: {deleted_message}",
+        f"Mesaj silindi. Sira: {position}, "
+        f"Mesaj: {deleted_message}",
         flush=True,
     )
 
-    return True
+    return deleted_message
 
 
+# ----------------------------------------------------
+# WhatsApp uzaktan yönetim komutları
+# ----------------------------------------------------
 def process_remote_command(sender, message_text):
     global stored_messages
     global message_counter
 
-    if sender != AUTHORIZED_NUMBER:
-        return False
-
     command = message_text.strip().upper()
 
+    command_names = {
+        "LISTE",
+        "DURUM",
+        "YARDIM",
+        "SIL",
+    }
+
+    is_command = (
+        command in command_names
+        or command.startswith("SIL ")
+    )
+
+    # Normal mesajsa komut olarak işleme.
+    if not is_command:
+        return False
+
+    # Komutları yalnızca yetkili numaralar kullanabilir.
+    if sender not in AUTHORIZED_NUMBERS:
+        print(
+            f"Yetkisiz komut girisimi. Gonderen: {sender}",
+            flush=True,
+        )
+
+        send_whatsapp_text(
+            sender,
+            "⛔ Bu numaranın yönetim komutlarını "
+            "kullanma yetkisi yok.",
+        )
+
+        return True
+
+    reset_if_new_day()
+
+    if command == "LISTE":
+        send_whatsapp_text(
+            sender,
+            build_list_text(),
+        )
+        return True
+
+    if command == "DURUM":
+        count = len(stored_messages)
+
+        send_whatsapp_text(
+            sender,
+            (
+                f"📊 Bugün {count} kayıt var.\n"
+                f"📅 Tarih: {stored_date.strftime('%d.%m.%Y')}"
+            ),
+        )
+        return True
+
+    if command == "YARDIM":
+        send_whatsapp_text(
+            sender,
+            build_help_text(),
+        )
+        return True
+
     if command == "SIL":
+        deleted_count = len(stored_messages)
+
         stored_messages = []
         message_counter = 0
 
+        send_whatsapp_text(
+            sender,
+            (
+                "🗑️ Bugünkü tüm kayıtlar silindi.\n\n"
+                f"Silinen kayıt sayısı: {deleted_count}"
+            ),
+        )
+
         print(
-            f"Tum mesajlar uzaktan silindi. Gonderen: {sender}",
+            f"Tum mesajlar uzaktan silindi. "
+            f"Gonderen: {sender}",
             flush=True,
         )
 
         return True
 
     if command.startswith("SIL "):
-        number_text = command[4:].strip()
+        position_text = command[4:].strip()
 
         try:
-            position = int(number_text)
+            position = int(position_text)
+
         except ValueError:
-            print(
-                f"Gecersiz SIL komutu: {message_text}",
-                flush=True,
+            send_whatsapp_text(
+                sender,
+                (
+                    "⚠️ Geçersiz silme komutu.\n\n"
+                    "Örnek kullanım:\n"
+                    "SIL 3"
+                ),
             )
             return True
 
-        if not delete_message_by_position(position):
-            print(
-                f"Silinecek mesaj bulunamadi. Sira: {position}",
-                flush=True,
-            )
-
-        return True
-
-    if command == "LISTE":
-        print(
-            f"LISTE komutu alindi. Kayitli mesaj sayisi: "
-            f"{len(stored_messages)}",
-            flush=True,
+        deleted_message = delete_message_by_position(
+            position
         )
+
+        if deleted_message is None:
+            send_whatsapp_text(
+                sender,
+                (
+                    f"⚠️ {position} numaralı kayıt bulunamadı.\n\n"
+                    f"Mevcut kayıt sayısı: "
+                    f"{len(stored_messages)}"
+                ),
+            )
+            return True
+
+        deleted_text = deleted_message.get(
+            "message",
+            "",
+        )
+
+        response_text = (
+            f"✅ {position} numaralı kayıt silindi.\n\n"
+            f"Silinen kayıt:\n{deleted_text}\n\n"
+            f"{build_list_text()}"
+        )
+
+        send_whatsapp_text(
+            sender,
+            response_text,
+        )
+
         return True
 
     return False
 
 
+# ----------------------------------------------------
+# Ana sayfa
+# ----------------------------------------------------
 @app.get("/")
 def home():
     reset_if_new_day()
@@ -184,10 +474,14 @@ def home():
             "message": "WhatsApp ESP32 sunucusu calisiyor.",
             "stored_message_count": len(stored_messages),
             "date": stored_date.isoformat(),
+            "maximum_messages": MAX_MESSAGES,
         }
     ), 200
 
 
+# ----------------------------------------------------
+# Meta webhook doğrulama
+# ----------------------------------------------------
 @app.get("/webhook")
 def verify_webhook():
     mode = request.args.get("hub.mode")
@@ -201,13 +495,23 @@ def verify_webhook():
     )
 
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("Webhook basariyla dogrulandi.", flush=True)
+        print(
+            "Webhook basariyla dogrulandi.",
+            flush=True,
+        )
         return challenge or "", 200
 
-    print("Webhook dogrulamasi reddedildi.", flush=True)
+    print(
+        "Webhook dogrulamasi reddedildi.",
+        flush=True,
+    )
+
     return "Webhook dogrulanamadi.", 403
 
 
+# ----------------------------------------------------
+# Meta webhook mesajlarını alma
+# ----------------------------------------------------
 @app.post("/webhook")
 def receive_webhook():
     global stored_messages
@@ -222,7 +526,7 @@ def receive_webhook():
         raw_body = request.get_data(as_text=True)
 
         print(
-            f"Webhook JSON olarak okunamadi. Ham veri: {raw_body}",
+            f"Webhook JSON okunamadi. Ham veri: {raw_body}",
             flush=True,
         )
 
@@ -230,25 +534,30 @@ def receive_webhook():
 
     last_webhook_payload = data
 
-    print("========================================", flush=True)
+    print("=" * 40, flush=True)
     print("META WEBHOOK POST GELDI", flush=True)
+
     print(
-        json.dumps(data, ensure_ascii=False, indent=2),
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2,
+        ),
         flush=True,
     )
-    print("========================================", flush=True)
+
+    print("=" * 40, flush=True)
 
     try:
         entries = data.get("entry", [])
 
         if not entries:
             print(
-                "Webhook icinde entry alani bulunamadi.",
+                "Webhook icinde entry bulunamadi.",
                 flush=True,
             )
-            return "EVENT_RECEIVED", 200
 
-        message_found = False
+            return "EVENT_RECEIVED", 200
 
         for entry in entries:
             changes = entry.get("changes", [])
@@ -258,7 +567,10 @@ def receive_webhook():
                 messages = value.get("messages", [])
 
                 if not messages:
-                    statuses = value.get("statuses", [])
+                    statuses = value.get(
+                        "statuses",
+                        [],
+                    )
 
                     if statuses:
                         print(
@@ -269,48 +581,63 @@ def receive_webhook():
                     continue
 
                 for incoming in messages:
-                    message_found = True
+                    sender = str(
+                        incoming.get("from", "")
+                    )
 
-                    sender = incoming.get("from", "")
-                    message_text = extract_message_text(incoming)
+                    message_text = extract_message_text(
+                        incoming
+                    )
 
                     if not message_text:
                         print(
-                            "Bos mesaj alindi, kaydedilmedi.",
+                            "Bos mesaj kaydedilmedi.",
                             flush=True,
                         )
                         continue
 
+                    # Gelen içerik komutsa listeye ekleme.
                     if process_remote_command(
                         sender,
                         message_text,
                     ):
                         print(
-                            f"Uzaktan komut uygulandi: "
-                            f"{message_text}",
+                            f"Komut uygulandi: {message_text}",
                             flush=True,
                         )
                         continue
 
-                    whatsapp_timestamp = incoming.get("timestamp")
+                    whatsapp_timestamp = incoming.get(
+                        "timestamp"
+                    )
 
                     if whatsapp_timestamp:
                         try:
-                            received_at_utc = datetime.fromtimestamp(
-                                int(whatsapp_timestamp),
-                                tz=timezone.utc,
+                            received_at_utc = (
+                                datetime.fromtimestamp(
+                                    int(whatsapp_timestamp),
+                                    tz=timezone.utc,
+                                )
                             )
-                            received_at = received_at_utc.astimezone(
-                                ISTANBUL_TZ
-                            ).isoformat()
+
+                            received_at = (
+                                received_at_utc
+                                .astimezone(ISTANBUL_TZ)
+                                .isoformat()
+                            )
+
                         except (
                             ValueError,
                             TypeError,
                             OverflowError,
                         ):
-                            received_at = now_istanbul().isoformat()
+                            received_at = (
+                                now_istanbul().isoformat()
+                            )
                     else:
-                        received_at = now_istanbul().isoformat()
+                        received_at = (
+                            now_istanbul().isoformat()
+                        )
 
                     message_counter += 1
 
@@ -324,7 +651,9 @@ def receive_webhook():
                     stored_messages.append(new_message)
 
                     # En fazla son 5 mesaj tutulur.
-                    stored_messages = stored_messages[-MAX_MESSAGES:]
+                    stored_messages = stored_messages[
+                        -MAX_MESSAGES:
+                    ]
 
                     print(
                         "Yeni WhatsApp mesaji kaydedildi:",
@@ -332,15 +661,9 @@ def receive_webhook():
                         flush=True,
                     )
 
-        if not message_found:
-            print(
-                "Webhook geldi fakat yeni mesaj bulunamadi.",
-                flush=True,
-            )
-
     except Exception as error:
         print(
-            f"Webhook islenirken hata olustu: "
+            f"Webhook isleme hatasi: "
             f"{type(error).__name__}: {error}",
             flush=True,
         )
@@ -348,6 +671,9 @@ def receive_webhook():
     return "EVENT_RECEIVED", 200
 
 
+# ----------------------------------------------------
+# ESP32 için en fazla 5 mesajlık liste
+# ----------------------------------------------------
 @app.get("/messages")
 def get_messages():
     reset_if_new_day()
@@ -363,11 +689,15 @@ def get_messages():
     response.headers["Cache-Control"] = (
         "no-store, no-cache, must-revalidate, max-age=0"
     )
+
     response.headers["Pragma"] = "no-cache"
 
     return response, 200
 
 
+# ----------------------------------------------------
+# Eski ESP32 kodları için son mesaj endpoint'i
+# ----------------------------------------------------
 @app.get("/message")
 def get_last_message():
     reset_if_new_day()
@@ -387,11 +717,15 @@ def get_last_message():
     response.headers["Cache-Control"] = (
         "no-store, no-cache, must-revalidate, max-age=0"
     )
+
     response.headers["Pragma"] = "no-cache"
 
     return response, 200
 
 
+# ----------------------------------------------------
+# Hata ayıklama adresleri
+# ----------------------------------------------------
 @app.get("/debug/last-webhook")
 def get_last_webhook():
     return jsonify(last_webhook_payload), 200
@@ -403,7 +737,7 @@ def debug_messages():
 
     return jsonify(
         {
-            "authorized_number": AUTHORIZED_NUMBER,
+            "authorized_numbers": sorted(AUTHORIZED_NUMBERS),
             "count": len(stored_messages),
             "date": stored_date.isoformat(),
             "messages": stored_messages,
@@ -411,43 +745,17 @@ def debug_messages():
     ), 200
 
 
-@app.post("/debug/test-message")
-def create_test_message():
-    global stored_messages
-    global message_counter
-
-    reset_if_new_day()
-
-    data = request.get_json(silent=True) or {}
-
-    sender = str(data.get("sender", "test"))
-    message_text = str(
-        data.get("message", "ESP32 test mesaji")
-    ).strip()
-
-    message_counter += 1
-
-    new_message = {
-        "id": message_counter,
-        "sender": sender,
-        "message": message_text,
-        "received_at": now_istanbul().isoformat(),
-    }
-
-    stored_messages.append(new_message)
-    stored_messages = stored_messages[-MAX_MESSAGES:]
-
-    print(
-        "Manuel test mesaji olusturuldu:",
-        new_message,
-        flush=True,
+# ----------------------------------------------------
+# Uygulamayı çalıştır
+# ----------------------------------------------------
+if __name__ == "__main__":
+    port = int(
+        os.getenv(
+            "PORT",
+            "5000",
+        )
     )
 
-    return jsonify(new_message), 200
-
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
     app.run(
         host="0.0.0.0",
         port=port,
