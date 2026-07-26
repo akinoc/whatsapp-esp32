@@ -85,6 +85,15 @@ def reset_if_new_day():
 # WhatsApp üzerinden cevap gönderme
 # ----------------------------------------------------
 def send_whatsapp_text(recipient, text):
+    print("=" * 60, flush=True)
+    print("send_whatsapp_text() CALISTI", flush=True)
+    print(f"Alici: {recipient}", flush=True)
+    print(f"Token var mi: {bool(WHATSAPP_ACCESS_TOKEN)}", flush=True)
+    print(f"Phone Number ID var mi: {bool(WHATSAPP_PHONE_NUMBER_ID)}", flush=True)
+    print(f"Phone Number ID: {WHATSAPP_PHONE_NUMBER_ID}", flush=True)
+    print(f"Graph API Version: {GRAPH_API_VERSION}", flush=True)
+    print("=" * 60, flush=True)
+
     if not WHATSAPP_ACCESS_TOKEN:
         print(
             "WHATSAPP_ACCESS_TOKEN tanimlanmamis.",
@@ -129,6 +138,10 @@ def send_whatsapp_text(recipient, text):
     }
 
     try:
+        print(f"Meta API adresi: {url}", flush=True)
+        print(f"Gonderilecek alici: {recipient}", flush=True)
+        print(f"Gonderilecek metin: {text}", flush=True)
+
         response = requests.post(
             url,
             headers=headers,
@@ -138,6 +151,10 @@ def send_whatsapp_text(recipient, text):
 
         print(
             f"WhatsApp cevap HTTP kodu: {response.status_code}",
+            flush=True,
+        )
+        print(
+            f"WhatsApp API cevabi: {response.text}",
             flush=True,
         )
 
@@ -361,9 +378,21 @@ def process_remote_command(sender, message_text):
     reset_if_new_day()
 
     if command == "LISTE":
-        send_whatsapp_text(
+        print(
+            f"LISTE komutu alindi. Kayitli mesaj sayisi: "
+            f"{len(stored_messages)}",
+            flush=True,
+        )
+
+        response_text = build_list_text()
+        send_result = send_whatsapp_text(
             sender,
-            build_list_text(),
+            response_text,
+        )
+
+        print(
+            f"LISTE WhatsApp cevap sonucu: {send_result}",
+            flush=True,
         )
         return True
 
