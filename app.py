@@ -1,14 +1,53 @@
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
 VERIFY_TOKEN = "akin123"
-
-# Son 20 mesajı bellekte tutar
 MAX_MESSAGES = 20
+DEFAULT_DEVICE_LIMIT = 5
+
 messages_history = []
 message_counter = 0
+ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
+
+TURKISH_MONTHS = [
+    "Ocak", "Subat", "Mart", "Nisan", "Mayis", "Haziran",
+    "Temmuz", "Agustos", "Eylul", "Ekim", "Kasim", "Aralik"
+]
+
+TURKISH_DAYS = [
+    "Pazartesi", "Sali", "Carsamba", "Persembe",
+    "Cuma", "Cumartesi", "Pazar"
+]
+
+
+def parse_whatsapp_timestamp(raw_timestamp):
+    """WhatsApp Unix zamanını UTC datetime'a dönüştürür."""
+    try:
+        return datetime.fromtimestamp(int(raw_timestamp), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return datetime.now(timezone.utc)
+
+
+def format_turkish_datetime(utc_datetime):
+    local_datetime = utc_datetime.astimezone(ISTANBUL_TZ)
+    return (
+        f"{local_datetime.day} "
+        f"{TURKISH_MONTHS[local_datetime.month - 1]} "
+        f"{TURKISH_DAYS[local_datetime.weekday()]} "
+        f"{local_datetime:%H:%M}"
+    )
+
+
+def mask_sender(sender):
+    sender = str(sender or "").strip()
+    if not sender:
+        return "Bilinmiyor"
+    if len(sender) <= 2:
+        return sender
+    return "*" * (len(sender) - 2) + sender[-2:]
 
 
 @app.route("/webhook", methods=["GET"])
@@ -33,9 +72,7 @@ def receive_whatsapp_message():
         value = data["entry"][0]["changes"][0]["value"]
         incoming_messages = value.get("messages", [])
 
-        if incoming_messages:
-            incoming = incoming_messages[0]
-
+        for incoming in incoming_messages:
             sender = incoming.get("from", "")
             message_type = incoming.get("type", "")
 
@@ -44,20 +81,22 @@ def receive_whatsapp_message():
             else:
                 message_text = f"[{message_type or 'bilinmeyen'} mesaj]"
 
+            utc_datetime = parse_whatsapp_timestamp(incoming.get("timestamp"))
             message_counter += 1
 
             new_message = {
                 "id": message_counter,
                 "sender": sender,
+                "masked_sender": mask_sender(sender),
                 "message": message_text,
-                "timestamp": datetime.utcnow().isoformat() + "Z"
+                "timestamp": utc_datetime.isoformat().replace("+00:00", "Z"),
+                "display_time": format_turkish_datetime(utc_datetime),
             }
 
             messages_history.append(new_message)
 
-            # Sadece son 20 mesajı tut
             if len(messages_history) > MAX_MESSAGES:
-                messages_history.pop(0)
+                del messages_history[:-MAX_MESSAGES]
 
             print(f"Yeni mesaj: {new_message}")
 
@@ -67,25 +106,35 @@ def receive_whatsapp_message():
     return "EVENT_RECEIVED", 200
 
 
-# Sadece en son mesaj
 @app.route("/message", methods=["GET"])
 def get_last_message():
     if not messages_history:
         return jsonify({
             "id": 0,
             "sender": "",
-            "message": ""
+            "masked_sender": "",
+            "message": "",
+            "timestamp": "",
+            "display_time": "",
         })
 
     return jsonify(messages_history[-1])
 
 
-# Tüm kayıtlı mesajlar
 @app.route("/messages", methods=["GET"])
 def get_all_messages():
+    try:
+        requested_limit = int(request.args.get("limit", DEFAULT_DEVICE_LIMIT))
+    except (TypeError, ValueError):
+        requested_limit = DEFAULT_DEVICE_LIMIT
+
+    limit = max(1, min(requested_limit, MAX_MESSAGES))
+    selected_messages = messages_history[-limit:]
+
     return jsonify({
-        "count": len(messages_history),
-        "messages": messages_history
+        "count": len(selected_messages),
+        "total_count": len(messages_history),
+        "messages": selected_messages,
     })
 
 
