@@ -14,11 +14,11 @@ DEFAULT_DEVICE_LIMIT = 5
 
 # WhatsApp Cloud API ayarlari.
 # Render > Environment bolumune ekle:
-# WHATSAPP_TOKEN      = Meta access token
-# PHONE_NUMBER_ID     = WhatsApp Phone Number ID
+# WHATSAPP_ACCESS_TOKEN      = Meta access token
+# WHATSAPP_PHONE_NUMBER_ID   = WhatsApp Phone Number ID
 # GRAPH_API_VERSION   = v23.0   (istersen degistirebilirsin)
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v23.0")
 
 messages_history = []
@@ -87,7 +87,7 @@ def send_whatsapp_text(to_number, text):
     if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
         print(
             "WhatsApp cevabi gonderilemedi: "
-            "WHATSAPP_TOKEN veya PHONE_NUMBER_ID tanimli degil."
+            "WHATSAPP_ACCESS_TOKEN veya WHATSAPP_PHONE_NUMBER_ID tanimli degil."
         )
         return False
 
