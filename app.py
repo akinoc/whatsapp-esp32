@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import json
 import os
@@ -9,7 +9,7 @@ import urllib.error
 app = Flask(__name__)
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "akin123")
-MAX_MESSAGES = 20
+MESSAGE_RETENTION_HOURS = 24
 DEFAULT_DEVICE_LIMIT = 5
 
 # WhatsApp Cloud API ayarlari.
@@ -58,9 +58,9 @@ def mask_sender(sender):
     sender = str(sender or "").strip()
     if not sender:
         return "Bilinmiyor"
-    if len(sender) <= 2:
+    if len(sender) <= 4:
         return sender
-    return "*" * (len(sender) - 2) + sender[-2:]
+    return "*" * (len(sender) - 4) + sender[-4:]
 
 
 def normalize_command(text):
@@ -137,6 +137,26 @@ def send_whatsapp_text(to_number, text):
     return False
 
 
+
+def prune_old_messages():
+    """24 saatten eski mesajlari bellekten siler."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=MESSAGE_RETENTION_HOURS)
+
+    kept_messages = []
+    for item in messages_history:
+        try:
+            item_time = datetime.fromisoformat(
+                str(item.get("timestamp", "")).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            continue
+
+        if item_time >= cutoff:
+            kept_messages.append(item)
+
+    messages_history[:] = kept_messages
+
+
 def build_help_text():
     return (
         "Kullanilabilir komutlar:\n"
@@ -152,10 +172,12 @@ def build_help_text():
 
 
 def build_list_text():
+    prune_old_messages()
+
     if not messages_history:
         return "Kayitli mesaj bulunmuyor."
 
-    lines = [f"Kayitli mesajlar ({len(messages_history)}/{MAX_MESSAGES}):"]
+    lines = [f"Son {MESSAGE_RETENTION_HOURS} saatteki mesajlar ({len(messages_history)}):"]
 
     for item in messages_history:
         message = str(item.get("message", "")).replace("\n", " ").strip()
@@ -184,6 +206,7 @@ def handle_command(sender, message_text):
     Komutsa islemi yapar ve True doner.
     Boylece YARDIM/LISTE/SIL/TEMIZLE komutlari ekranda normal mesaj olarak gorunmez.
     """
+    prune_old_messages()
     command = normalize_command(message_text)
 
     if command == "YARDIM":
@@ -301,9 +324,7 @@ def receive_whatsapp_message():
             }
 
             messages_history.append(new_message)
-
-            if len(messages_history) > MAX_MESSAGES:
-                del messages_history[:-MAX_MESSAGES]
+            prune_old_messages()
 
             print(f"Yeni mesaj: {new_message}")
 
@@ -315,6 +336,8 @@ def receive_whatsapp_message():
 
 @app.route("/message", methods=["GET"])
 def get_last_message():
+    prune_old_messages()
+
     if not messages_history:
         return jsonify({
             "id": 0,
@@ -330,6 +353,12 @@ def get_last_message():
 
 @app.route("/messages", methods=["GET"])
 def get_all_messages():
+    prune_old_messages()
+
+    all_requested = str(request.args.get("all", "")).strip().lower() in (
+        "1", "true", "yes", "evet"
+    )
+
     try:
         requested_limit = int(
             request.args.get("limit", DEFAULT_DEVICE_LIMIT)
@@ -337,12 +366,17 @@ def get_all_messages():
     except (TypeError, ValueError):
         requested_limit = DEFAULT_DEVICE_LIMIT
 
-    limit = max(1, min(requested_limit, MAX_MESSAGES))
-    selected_messages = messages_history[-limit:]
+    # /messages?all=1 veya /messages?limit=0 -> son 24 saatin TAMAMI
+    if all_requested or requested_limit == 0:
+        selected_messages = list(messages_history)
+    else:
+        limit = max(1, requested_limit)
+        selected_messages = messages_history[-limit:]
 
     return jsonify({
         "count": len(selected_messages),
         "total_count": len(messages_history),
+        "retention_hours": MESSAGE_RETENTION_HOURS,
         "messages": selected_messages,
     })
 
