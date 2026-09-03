@@ -3,14 +3,15 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import json
 import os
+import sqlite3
 import urllib.request
 import urllib.error
 
 app = Flask(__name__)
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "akin123")
-MESSAGE_RETENTION_HOURS = 24
 DEFAULT_DEVICE_LIMIT = 5
+DB_PATH = os.getenv("DB_PATH", "/var/data/messages.db")
 
 # WhatsApp Cloud API ayarlari.
 # Render > Environment bolumune ekle:
@@ -21,8 +22,6 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v23.0")
 
-messages_history = []
-message_counter = 0
 ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
 
 TURKISH_MONTHS = [
@@ -34,6 +33,161 @@ TURKISH_DAYS = [
     "Pazartesi", "Sali", "Carsamba", "Persembe",
     "Cuma", "Cumartesi", "Pazar"
 ]
+
+
+
+def get_db():
+    """SQLite baglantisi acar. Render Persistent Disk kullaniliyorsa veri restartta da korunur."""
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT NOT NULL,
+                masked_sender TEXT NOT NULL,
+                message TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                display_time TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_timestamp "
+            "ON messages(timestamp)"
+        )
+
+
+def today_start_utc():
+    """Istanbul saatine gore bugunun 00:00 anini UTC olarak dondurur."""
+    now_local = datetime.now(ISTANBUL_TZ)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(timezone.utc)
+
+
+def tomorrow_start_utc():
+    """Istanbul saatine gore yarinin 00:00 anini UTC olarak dondurur."""
+    return today_start_utc() + timedelta(days=1)
+
+
+def cleanup_previous_days():
+    """Istanbul saatine gore bugun 00:00'dan eski tum mesajlari siler."""
+    cutoff = today_start_utc().isoformat().replace("+00:00", "Z")
+    with get_db() as conn:
+        conn.execute("DELETE FROM messages WHERE timestamp < ?", (cutoff,))
+
+
+def row_to_dict(row):
+    return {
+        "id": row["id"],
+        "sender": row["sender"],
+        "masked_sender": row["masked_sender"],
+        "message": row["message"],
+        "timestamp": row["timestamp"],
+        "display_time": row["display_time"],
+    }
+
+
+def get_today_messages(limit=None):
+    cleanup_previous_days()
+    start = today_start_utc().isoformat().replace("+00:00", "Z")
+    end = tomorrow_start_utc().isoformat().replace("+00:00", "Z")
+
+    sql = """
+        SELECT id, sender, masked_sender, message, timestamp, display_time
+        FROM messages
+        WHERE timestamp >= ? AND timestamp < ?
+        ORDER BY id ASC
+    """
+    params = [start, end]
+
+    if limit is not None and limit > 0:
+        sql = """
+            SELECT id, sender, masked_sender, message, timestamp, display_time
+            FROM (
+                SELECT id, sender, masked_sender, message, timestamp, display_time
+                FROM messages
+                WHERE timestamp >= ? AND timestamp < ?
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            ORDER BY id ASC
+        """
+        params.append(limit)
+
+    with get_db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    return [row_to_dict(row) for row in rows]
+
+
+def insert_message(sender, masked_sender, message, timestamp, display_time):
+    cleanup_previous_days()
+    with get_db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO messages
+                (sender, masked_sender, message, timestamp, display_time)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (sender, masked_sender, message, timestamp, display_time),
+        )
+        message_id = cursor.lastrowid
+
+    return message_id
+
+
+def delete_message_by_id_db(message_id):
+    cleanup_previous_days()
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT id, sender, masked_sender, message, timestamp, display_time
+            FROM messages
+            WHERE id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+        return row_to_dict(row)
+
+
+def delete_last_message_db():
+    cleanup_previous_days()
+    messages = get_today_messages()
+    if not messages:
+        return None
+    return delete_message_by_id_db(messages[-1]["id"])
+
+
+def clear_today_messages():
+    cleanup_previous_days()
+    start = today_start_utc().isoformat().replace("+00:00", "Z")
+    end = tomorrow_start_utc().isoformat().replace("+00:00", "Z")
+
+    with get_db() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE timestamp >= ? AND timestamp < ?",
+            (start, end),
+        ).fetchone()[0]
+
+        conn.execute(
+            "DELETE FROM messages WHERE timestamp >= ? AND timestamp < ?",
+            (start, end),
+        )
+
+    return count
 
 
 def parse_whatsapp_timestamp(raw_timestamp):
@@ -138,24 +292,6 @@ def send_whatsapp_text(to_number, text):
 
 
 
-def prune_old_messages():
-    """24 saatten eski mesajlari bellekten siler."""
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=MESSAGE_RETENTION_HOURS)
-
-    kept_messages = []
-    for item in messages_history:
-        try:
-            item_time = datetime.fromisoformat(
-                str(item.get("timestamp", "")).replace("Z", "+00:00")
-            )
-        except (TypeError, ValueError):
-            continue
-
-        if item_time >= cutoff:
-            kept_messages.append(item)
-
-    messages_history[:] = kept_messages
-
 
 def build_help_text():
     return (
@@ -172,15 +308,16 @@ def build_help_text():
 
 
 def build_list_text():
-    prune_old_messages()
+    messages = get_today_messages()
 
-    if not messages_history:
-        return "Kayitli mesaj bulunmuyor."
+    if not messages:
+        return "Bugune ait kayitli mesaj bulunmuyor."
 
-    lines = [f"Son {MESSAGE_RETENTION_HOURS} saatteki mesajlar ({len(messages_history)}):"]
+    lines = [f"Bugunun kayitli mesajlari ({len(messages)}):"]
 
-    for item in messages_history:
-        message = str(item.get("message", "")).replace("\n", " ").strip()
+    for item in messages:
+        message = str(item.get("message", "")).replace("
+", " ").strip()
         if len(message) > 80:
             message = message[:77] + "..."
 
@@ -191,22 +328,18 @@ def build_list_text():
             f"{message}"
         )
 
-    return "\n".join(lines)
+    return "
+".join(lines)
 
 
-def delete_message_by_id(message_id):
-    for index, item in enumerate(messages_history):
-        if item.get("id") == message_id:
-            return messages_history.pop(index)
-    return None
 
 
 def handle_command(sender, message_text):
     """
     Komutsa islemi yapar ve True doner.
-    Boylece YARDIM/LISTE/SIL/TEMIZLE komutlari ekranda normal mesaj olarak gorunmez.
+    YARDIM/LISTE/SIL/TEMIZLE komutlari ekranda normal mesaj olarak gorunmez.
     """
-    prune_old_messages()
+    cleanup_previous_days()
     command = normalize_command(message_text)
 
     if command == "YARDIM":
@@ -215,21 +348,22 @@ def handle_command(sender, message_text):
         return True
 
     if command == "LISTE":
-        print(
-            f"LISTE komutu alindi. Kayitli mesaj sayisi: "
-            f"{len(messages_history)}"
-        )
+        messages = get_today_messages()
+        print(f"LISTE komutu alindi. Bugunku mesaj sayisi: {len(messages)}")
         send_whatsapp_text(sender, build_list_text())
         return True
 
     if command == "SIL":
-        if not messages_history:
+        deleted = delete_last_message_db()
+
+        if deleted is None:
             reply = "Silinecek kayitli mesaj bulunmuyor."
         else:
-            deleted = messages_history.pop()
             reply = (
-                f"Son mesaj silindi.\n"
-                f"ID: {deleted.get('id')}\n"
+                f"Son mesaj silindi.
+"
+                f"ID: {deleted.get('id')}
+"
                 f"Mesaj: {deleted.get('message', '')}"
             )
 
@@ -249,31 +383,32 @@ def handle_command(sender, message_text):
             )
             return True
 
-        deleted = delete_message_by_id(message_id)
+        deleted = delete_message_by_id_db(message_id)
 
         if deleted:
             reply = (
-                f"Mesaj silindi.\n"
-                f"ID: {deleted.get('id')}\n"
+                f"Mesaj silindi.
+"
+                f"ID: {deleted.get('id')}
+"
                 f"Mesaj: {deleted.get('message', '')}"
             )
         else:
-            reply = f"ID {message_id} ile kayitli mesaj bulunamadi."
+            reply = f"ID {message_id} ile bugune ait kayitli mesaj bulunamadi."
 
         print(f"SIL {message_id} komutu alindi -> {reply}")
         send_whatsapp_text(sender, reply)
         return True
 
     if command in ("TEMIZLE", "TEMİZLE"):
-        count = len(messages_history)
-        messages_history.clear()
-
-        reply = f"{count} kayit silindi. Mesaj listesi temizlendi."
+        count = clear_today_messages()
+        reply = f"{count} kayit silindi. Bugunun mesaj listesi temizlendi."
         print(f"TEMIZLE komutu alindi -> {count} mesaj silindi.")
         send_whatsapp_text(sender, reply)
         return True
 
     return False
+
 
 
 @app.route("/webhook", methods=["GET"])
@@ -290,8 +425,6 @@ def verify_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def receive_whatsapp_message():
-    global message_counter
-
     data = request.get_json(silent=True) or {}
 
     try:
@@ -310,21 +443,28 @@ def receive_whatsapp_message():
             # Komutlar normal mesaj listesine eklenmez.
             if message_type == "text" and handle_command(sender, message_text):
                 continue
-
             utc_datetime = parse_whatsapp_timestamp(incoming.get("timestamp"))
-            message_counter += 1
+
+            timestamp = utc_datetime.isoformat().replace("+00:00", "Z")
+            display_time = format_turkish_datetime(utc_datetime)
+            masked_sender = mask_sender(sender)
+
+            message_id = insert_message(
+                sender=sender,
+                masked_sender=masked_sender,
+                message=message_text,
+                timestamp=timestamp,
+                display_time=display_time,
+            )
 
             new_message = {
-                "id": message_counter,
+                "id": message_id,
                 "sender": sender,
-                "masked_sender": mask_sender(sender),
+                "masked_sender": masked_sender,
                 "message": message_text,
-                "timestamp": utc_datetime.isoformat().replace("+00:00", "Z"),
-                "display_time": format_turkish_datetime(utc_datetime),
+                "timestamp": timestamp,
+                "display_time": display_time,
             }
-
-            messages_history.append(new_message)
-            prune_old_messages()
 
             print(f"Yeni mesaj: {new_message}")
 
@@ -336,9 +476,9 @@ def receive_whatsapp_message():
 
 @app.route("/message", methods=["GET"])
 def get_last_message():
-    prune_old_messages()
+    messages = get_today_messages(limit=1)
 
-    if not messages_history:
+    if not messages:
         return jsonify({
             "id": 0,
             "sender": "",
@@ -348,12 +488,13 @@ def get_last_message():
             "display_time": "",
         })
 
-    return jsonify(messages_history[-1])
+    return jsonify(messages[-1])
+
 
 
 @app.route("/messages", methods=["GET"])
 def get_all_messages():
-    prune_old_messages()
+    cleanup_previous_days()
 
     all_requested = str(request.args.get("all", "")).strip().lower() in (
         "1", "true", "yes", "evet"
@@ -366,20 +507,24 @@ def get_all_messages():
     except (TypeError, ValueError):
         requested_limit = DEFAULT_DEVICE_LIMIT
 
-    # /messages?all=1 veya /messages?limit=0 -> son 24 saatin TAMAMI
     if all_requested or requested_limit == 0:
-        selected_messages = list(messages_history)
+        selected_messages = get_today_messages()
     else:
-        limit = max(1, requested_limit)
-        selected_messages = messages_history[-limit:]
+        selected_messages = get_today_messages(limit=max(1, requested_limit))
+
+    total_count = len(get_today_messages())
 
     return jsonify({
         "count": len(selected_messages),
-        "total_count": len(messages_history),
-        "retention_hours": MESSAGE_RETENTION_HOURS,
+        "total_count": total_count,
+        "day_reset": "Europe/Istanbul 00:00",
         "messages": selected_messages,
     })
 
+
+
+init_db()
+cleanup_previous_days()
 
 @app.route("/", methods=["GET"])
 def home():
